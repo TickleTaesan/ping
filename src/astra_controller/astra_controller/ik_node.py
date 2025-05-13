@@ -1,155 +1,141 @@
-import math
-from pathlib import Path
-import rclpy
-import rclpy.node
-import rclpy.qos
+import math  # Library for mathematical functions like pi and fmod
+from pathlib import Path  # Library for handling file paths in a platform-independent way
+import rclpy  # ROS 2 Python client library for node creation and communication
+import rclpy.node  # Base class for creating ROS nodes
+import rclpy.qos  # Quality of Service settings for reliable communication
 
-import geometry_msgs.msg
-import astra_controller_interfaces.msg
-import std_msgs.msg
+import geometry_msgs.msg  # ROS messages for geometry data, e.g., PoseStamped
+import astra_controller_interfaces.msg  # Custom ROS messages for joint commands
+import std_msgs.msg  # Standard ROS messages, e.g., String for errors
 
-from ament_index_python import get_package_share_directory
+from ament_index_python import get_package_share_directory  # Function to locate package share directories
 
-from typing import Any, List, Tuple, Union
+from typing import Any, List, Tuple, Union  # Type hints for better code readability
 
-import modern_robotics as mr
-import numpy as np
-from mr_urdf_loader import loadURDF
-from pytransform3d import transformations as pt
+import modern_robotics as mr  # Library for robot kinematics calculations
+import numpy as np  # Library for numerical operations, especially with arrays
+from mr_urdf_loader import loadURDF  # Utility to load URDF files for robot models
+from pytransform3d import transformations as pt  # Library for 3D transformation operations
 
-import logging
+import logging  # Library for logging debug/info/error messages
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # Create a logger specific to this module
 
-np.set_printoptions(precision=4, suppress=True)
+np.set_printoptions(precision=4, suppress=True)  # Configure NumPy to print with 4 decimal places and suppress small values
 
 def pq_from_ros_pose(msg: geometry_msgs.msg.Pose):
+    # Convert a ROS Pose message to a position-quaternion list [x, y, z, w, qx, qy, qz]
     return [
-        msg.position.x,
-        msg.position.y,
-        msg.position.z,
-        msg.orientation.w,
-        msg.orientation.x,
-        msg.orientation.y,
-        msg.orientation.z
+        msg.position.x,  # X position
+        msg.position.y,  # Y position
+        msg.position.z,  # Z position
+        msg.orientation.w,  # Quaternion w component
+        msg.orientation.x,  # Quaternion x component
+        msg.orientation.y,  # Quaternion y component
+        msg.orientation.z  # Quaternion z component
     ]
 
 def main(args=None):
-    rclpy.init(args=args)
+    # Main function to set up and run the ROS node
+    rclpy.init(args=args)  # Initialize the ROS 2 runtime
 
-    node = rclpy.node.Node("ik_node")
+    node = rclpy.node.Node("ik_node")  # Create a ROS node named "ik_node"
     
-    node.declare_parameter('eef_link_name', 'link_ree_teleop')
-    node.declare_parameter('joint_names', [ 'joint_r1', 'joint_r2', 'joint_r3', 'joint_r4', 'joint_r5', 'joint_r6' ])
+    node.declare_parameter('eef_link_name', 'link_ree_teleop')  # Declare parameter for end-effector link name
+    node.declare_parameter('joint_names', ['joint_r1', 'joint_r2', 'joint_r3', 'joint_r4', 'joint_r5', 'joint_r6'])  # Declare parameter for joint names
+    node.declare_parameter('joint_names', ['joint_l1', 'joint_l2', 'joint_l3', 'joint_l4', 'joint_l5', 'joint_l6'])  # Declare parameter for joint names
 
-    eef_link_name = node.get_parameter('eef_link_name').value
-    joint_names = node.get_parameter('joint_names').value
+    eef_link_name = node.get_parameter('eef_link_name').value  # Get the end-effector link name
+    joint_names = node.get_parameter('joint_names').value  # Get the list of joint names
     
-    assert len(joint_names) == 6
+    assert len(joint_names) == 6  # Ensure there are exactly 6 joints (1 lift + 5 arm)
 
-    # Ref: interbotix_ros_toolboxes/interbotix_xs_toolbox/interbotix_xs_modules/interbotix_xs_modules/xs_robot/arm.py
+    # Construct the path to the URDF file for the robot model
     urdf_name = str(Path(get_package_share_directory("astra_description")) / "urdf" / "astra_description_rel.urdf")
-
-    M, Slist, Blist, Mlist, Glist, robot = loadURDF(
-        urdf_name, 
-        eef_link_name=eef_link_name, 
-        actuated_joint_names=joint_names
+    M, Slist, Blist, Mlist, Glist, robot = loadURDF(  # Load the URDF model
+        urdf_name,  # Path to the URDF file
+        eef_link_name=eef_link_name,  # Name of the end-effector link
+        actuated_joint_names=joint_names  # Names of the actuated joints
     )
     
-    joint_limit_lower = []
-    joint_limit_upper = []
-    for joint_name in joint_names:
-        joint = robot.joint_map[joint_name]
-        joint_limit_lower.append(joint.limit.lower)
-        joint_limit_upper.append(joint.limit.upper)
+    # Extract joint limits from the URDF model
+    joint_limit_lower = [robot.joint_map[joint_name].limit.lower for joint_name in joint_names]  # Lower limits for each joint
+    joint_limit_upper = [robot.joint_map[joint_name].limit.upper for joint_name in joint_names]  # Upper limits for each joint
 
-    arm_joint_command_publisher = node.create_publisher(astra_controller_interfaces.msg.JointCommand, "arm/joint_command", 10)
-    lift_joint_command_publisher = node.create_publisher(astra_controller_interfaces.msg.JointCommand, "lift/joint_command", 10)
+    # Create publishers for sending joint commands
+    arm_joint_command_publisher = node.create_publisher(astra_controller_interfaces.msg.JointCommand, "arm/joint_command", 10)  # Publisher for arm joints
+    lift_joint_command_publisher = node.create_publisher(astra_controller_interfaces.msg.JointCommand, "lift/joint_command", 10)  # Publisher for lift joint
     
-    error_publisher = node.create_publisher(std_msgs.msg.String, "ik_error", 10)
+    error_publisher = node.create_publisher(std_msgs.msg.String, "ik_error", 10)  # Publisher for IK error messages
         
     def pub_theta(theta_list):
-        msg = astra_controller_interfaces.msg.JointCommand(
-            name=joint_names[1:],
-            position_cmd=list(theta_list[1:])
+        # Publish joint commands for arm and lift separately
+        msg = astra_controller_interfaces.msg.JointCommand(  # Create message for arm joints
+            name=joint_names[1:],  # Arm joints (excluding lift, joint_r1)
+            position_cmd=list(theta_list[1:])  # Position commands for arm joints
         )
-        arm_joint_command_publisher.publish(msg)
+        arm_joint_command_publisher.publish(msg)  # Publish arm joint commands
 
-        msg = astra_controller_interfaces.msg.JointCommand(
-            name=joint_names[:1],
-            position_cmd=list(theta_list[:1])
+        msg = astra_controller_interfaces.msg.JointCommand(  # Create message for lift joint
+            name=joint_names[:1],  # Lift joint (joint_r1)
+            position_cmd=list(theta_list[:1])  # Position command for lift joint
         )
-        lift_joint_command_publisher.publish(msg)
+        lift_joint_command_publisher.publish(msg)  # Publish lift joint command
         
-    last_theta_list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    last_theta_list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # Initial guess for joint angles (all zero)
 
-    def set_ee_pose_matrix(
-        T_sd: np.ndarray,
-    ) -> Tuple[Union[np.ndarray, Any, List[float]], bool]:
-        """
-        Command a desired end effector pose.
-
-        :param T_sd: 4x4 Transformation Matrix representing the transform from the
-            /<robot_name>/base_link frame to the /<robot_name>/ee_gripper_link frame
-        :return: joint values needed to get the end effector to the desired pose
-        :return: `True` if a valid solution was found; `False` otherwise
-        """
-        logger.debug(f'Setting ee_pose to matrix=\n{T_sd}')
+    def set_ee_pose_matrix(T_sd: np.ndarray) -> Tuple[Union[np.ndarray, Any, List[float]], bool]:
+        # Compute joint angles to achieve a desired end-effector pose using inverse kinematics
+        logger.debug(f'Setting ee_pose to matrix=\n{T_sd}')  # Log the desired transformation matrix
         
-        nonlocal last_theta_list
+        nonlocal last_theta_list  # Use the last successful joint angles as an initial guess
         
-        for initial_guess in [
-            last_theta_list,
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        ]:
-            theta_list, success = mr.IKinSpace(
-                Slist=Slist,
-                M=M,
-                T=T_sd,
-                thetalist0=initial_guess,
-                eomg=0.001,
-                ev=0.001,
+        for initial_guess in [last_theta_list, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]:  # Try two initial guesses
+            theta_list, success = mr.IKinSpace(  # Perform inverse kinematics
+                Slist=Slist,  # Screw axes in the space frame
+                M=M,  # Home configuration of the end-effector
+                T=T_sd,  # Desired transformation matrix
+                thetalist0=initial_guess,  # Initial guess for joint angles
+                eomg=0.001,  # Orientation error tolerance
+                ev=0.001  # Position error tolerance
             )
             
-            if not success:
-                logger.warn('Failed guess. Maybe EEF is out of range.')
-                continue
+            if not success:  # If IK failed with this guess
+                logger.warn('Failed guess. Maybe EEF is out of range.')  # Log a warning
+                continue  # Try the next initial guess
             
-            before_clip = theta_list
-            if not ((joint_limit_lower <= theta_list) & (theta_list <= joint_limit_upper)).all():
-                for i in [1, 2, 3, 4, 5]:
-                    theta_list[i] = math.fmod(math.fmod(theta_list[i] + math.pi, 2*math.pi) + 2*math.pi, 2*math.pi) - math.pi
+            # Normalize joint angles to [-pi, pi] for arm joints (skip lift joint)
+            for i in [1, 2, 3, 4, 5]:  # Indices for arm joints (joint_r2 to joint_r6)
+                theta_list[i] = math.fmod(math.fmod(theta_list[i] + math.pi, 2*math.pi) + 2*math.pi, 2*math.pi) - math.pi
 
-            # Check to make sure a solution was found and that no joint limits were violated
-            ok = True
-            for i, (p, mn, mx) in enumerate(zip(theta_list, joint_limit_lower, joint_limit_upper)):
-                if not (mn <= p <= mx):
-                    logger.error(f"Joint #{i+1} reach limit, min: {mn}, max: {mx}, current pos: {p}")
-                    ok = False
-            if not ok:
-                continue
+            # Check if the solution respects joint limits
+            ok = True  # Flag to track if all joints are within limits
+            for i, (p, mn, mx) in enumerate(zip(theta_list, joint_limit_lower, joint_limit_upper)):  # Iterate over joints
+                if not (mn <= p <= mx):  # If a joint exceeds its limits
+                    logger.error(f"Joint #{i+1} reach limit, min: {mn}, max: {mx}, current pos: {p}")  # Log the violation
+                    ok = False  # Mark solution as invalid
+            if not ok:  # If any joint limit was violated
+                continue  # Try the next initial guess
             
-            pub_theta(theta_list)
+            pub_theta(theta_list)  # Publish the valid joint angles
 
-            last_theta_list = theta_list
-            return theta_list, True
+            last_theta_list = theta_list  # Update the last successful solution
+            return theta_list, True  # Return the solution and success flag
         
-        error_publisher.publish(std_msgs.msg.String(data="IK failed"))
-        
-        logger.warn('No valid pose could be found. Will not execute')
-        return theta_list, False
+        error_publisher.publish(std_msgs.msg.String(data="IK failed"))  # Publish an error message if no solution found
+        logger.warn('No valid pose could be found. Will not execute')  # Log a warning
+        return theta_list, False  # Return the last attempted solution and failure flag
 
     def cb(msg: geometry_msgs.msg.PoseStamped):
-        set_ee_pose_matrix(pt.transform_from_pq(np.array(pq_from_ros_pose(msg.pose))))
-    node.create_subscription(geometry_msgs.msg.PoseStamped, "goal_pose", cb, rclpy.qos.qos_profile_sensor_data)
+        # Callback function for handling incoming goal pose messages
+        T_sd = pt.transform_from_pq(np.array(pq_from_ros_pose(msg.pose)))  # Convert ROS pose to transformation matrix
+        set_ee_pose_matrix(T_sd)  # Compute and set joint positions to achieve the pose
+    node.create_subscription(geometry_msgs.msg.PoseStamped, "goal_pose", cb, rclpy.qos.qos_profile_sensor_data)  # Subscribe to goal poses
 
-    rclpy.spin(node)
+    rclpy.spin(node)  # Enter the ROS event loop to process messages
 
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    node.destroy_node()
-    rclpy.shutdown()
+    node.destroy_node()  # Explicitly destroy the node (optional)
+    rclpy.shutdown()  # Shut down the ROS 2 runtime
 
 if __name__ == '__main__':
-    main()
+    main()  # Entry point of the script
